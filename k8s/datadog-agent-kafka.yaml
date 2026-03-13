@@ -1,0 +1,147 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: datadog-agent-kafka-confd
+  namespace: datadog
+  labels:
+    app: datadog-agent-kafka
+data:
+  # ── Agent configuration ────────────────────────────────────────────────────
+  # Overrides /etc/datadog-agent/datadog.yaml.
+  # Restricts the agent to file-based check discovery only — no Kubernetes
+  # auto-discovery, no listeners, no built-in infrastructure checks.
+  datadog.yaml: |-
+    log_to_console: true
+
+    # Only discover checks from conf.d files. Disabling all listeners and
+    # providers prevents the agent from auto-scheduling kubelet,
+    # orchestrator_pod, and other Kubernetes infrastructure checks.
+    config_providers:
+      - name: file
+        polling: true
+        poll_interval: 300
+    listeners: []
+
+    # Disable Cluster Agent and orchestrator check.
+    cluster_agent:
+      enabled: false
+    orchestrator_explorer:
+      enabled: false
+
+    # Disable kubelet check (not a DaemonSet — no access to node kubelet).
+    kubernetes_http_kubelet_port: 0
+    kubernetes_https_kubelet_port: 0
+
+    # Disable everything except checks.
+    apm_config:
+      enabled: false
+    logs_enabled: false
+    process_config:
+      process_collection:
+        enabled: false
+      container_collection:
+        enabled: false
+
+  # ── kafka_consumer_gcp check config ───────────────────────────────────────
+  kafka_consumer_gcp.yaml: |-
+    init_config:
+
+    instances:
+      - kafka_connect_str:
+          - "bootstrap.YOUR_CLUSTER.YOUR_REGION.managedkafka.YOUR_PROJECT.cloud.goog:9092"
+
+        security_protocol: "SASL_SSL"
+        sasl_mechanism: "OAUTHBEARER"
+
+        # Explicit values (also auto-parsed from bootstrap URL above)
+        cluster_name: "YOUR_CLUSTER"
+        gcp_region:   "YOUR_REGION"
+
+        consumer_groups:
+          "*":
+            "*": []
+
+        # ── Feature flags ────────────────────────────────────────────────
+        monitor_cluster_metrics:        true   # cluster / broker / topic metadata
+        monitor_consumer_group_states:  true   # consumer group states
+        monitor_record_counts:          true   # topic.records (high - low watermark)
+        monitor_log_dir_sizes:          false  # topic.log_size_bytes (may be unsupported)
+        collect_consumer_group_details: false  # member count via describe_consumer_groups
+        include_internal_topics:        false  # skip __consumer_offsets etc.
+        record_count_timeout:           5      # seconds per get_watermark_offsets call
+
+        tags:
+          - env:YOUR_ENV
+          - kafka_cluster:YOUR_CLUSTER
+          - cloud:gcp
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: datadog-agent-kafka
+  namespace: datadog
+  labels:
+    app: datadog-agent-kafka
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: datadog-agent-kafka
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: datadog-agent-kafka
+    spec:
+      automountServiceAccountToken: true
+      nodeSelector:
+        kubernetes.io/os: linux
+      containers:
+        - name: agent
+          image: YOUR_REGISTRY/datadog-kafka-agent:YOUR_TAG
+          imagePullPolicy: Always
+          env:
+            - name: DD_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: datadog-agent
+                  key: api-key
+            - name: DD_SITE
+              value: "datadoghq.com"
+            - name: DD_DD_URL
+              value: "https://app.datadoghq.com"
+            - name: DD_TAGS
+              value: '["team:YOUR_TEAM"]'
+            - name: DD_ADDITIONAL_CHECKSD
+              value: "/etc/datadog-agent/checks.d"
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: agent-cfg
+              mountPath: /etc/datadog-agent/datadog-kubernetes.yaml
+              subPath: datadog.yaml
+              readOnly: true
+            - name: confd-dir
+              mountPath: /etc/datadog-agent/conf.d
+              readOnly: true
+      volumes:
+        - name: agent-cfg
+          configMap:
+            name: datadog-agent-kafka-confd
+        - name: confd-dir
+          configMap:
+            name: datadog-agent-kafka-confd
+            items:
+              - key: kafka_consumer_gcp.yaml
+                path: kafka_consumer_gcp.yaml
+

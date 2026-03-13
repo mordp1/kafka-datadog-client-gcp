@@ -1,0 +1,99 @@
+# ─────────────────────────────────────────────────────────────
+# Quick connectivity test — GCP Managed Kafka Python quickstart style
+# Runs in the WORKING namespace/KSA (same as pod-kafka-sa.yaml)
+#
+# Apply:   kubectl apply -f k8s/kafka-python-quickstart-test.yaml
+# Logs:    kubectl -n YOUR_NAMESPACE logs -f pod/kafka-python-quickstart-test
+# Cleanup: kubectl delete -f k8s/kafka-python-quickstart-test.yaml
+# ─────────────────────────────────────────────────────────────
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kafka-python-quickstart-test
+ #namespace: YOUR_NAMESPACE
+  labels:
+    app: kafka-python-quickstart-test
+spec:
+  #serviceAccountName: kafka-sa
+  restartPolicy: Never
+  containers:
+    - name: python
+      image: python:3.11-slim
+      env:
+        - name: BOOTSTRAP
+          value: "bootstrap.YOUR_CLUSTER.YOUR_REGION.managedkafka.YOUR_PROJECT.cloud.goog:9092"
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          set -e
+          echo "==> Installing dependencies..."
+          pip install --quiet confluent-kafka google-auth requests
+
+          echo "==> Running GCP Managed Kafka quickstart test..."
+          python3 - <<'PYEOF'
+          import json, base64, datetime, time, sys
+          import google.auth
+          from google.auth.transport.requests import Request
+          from confluent_kafka.admin import AdminClient
+          import os
+
+          BOOTSTRAP = os.environ["BOOTSTRAP"]
+
+          # ── GCP OAuth token builder (Python equivalent of GcpLoginCallbackHandler) ──
+          credentials, project = google.auth.default(
+              scopes=["https://www.googleapis.com/auth/cloud-platform"]
+          )
+          print(f"[auth] Credentials type : {type(credentials).__name__}")
+          print(f"[auth] Project           : {project}")
+
+          credentials.refresh(Request())
+          print(f"[auth] Token prefix      : {credentials.token[:30]}...")
+          print(f"[auth] Token expiry      : {credentials.expiry}")
+          print(f"[auth] Valid             : {credentials.valid}")
+
+          def _b64(s):
+              return base64.urlsafe_b64encode(s.encode()).decode().rstrip("=")
+
+          def oauth_cb(config):
+              credentials.refresh(Request())
+              header  = json.dumps({"typ": "JWT", "alg": "GOOG_OAUTH2_TOKEN"})
+              payload = json.dumps({
+                  "exp": credentials.expiry.replace(tzinfo=datetime.timezone.utc).timestamp(),
+                  "iat": datetime.datetime.now(datetime.timezone.utc).timestamp(),
+                  "iss": "Google",
+                  "sub": getattr(credentials, "service_account_email", ""),
+              })
+              token = ".".join([_b64(header), _b64(payload), _b64(credentials.token)])
+              expiry = time.time() + (credentials.expiry.replace(
+                  tzinfo=datetime.timezone.utc) - datetime.datetime.now(datetime.timezone.utc)
+              ).total_seconds()
+              print(f"[oauth_cb] JWT length={len(token)}, expiry_in={expiry - time.time():.0f}s")
+              return token, expiry
+
+          # ── AdminClient connection test ──
+          print(f"\n[kafka] Connecting to {BOOTSTRAP} ...")
+          admin = AdminClient({
+              "bootstrap.servers"  : BOOTSTRAP,
+              "security.protocol"  : "SASL_SSL",
+              "sasl.mechanisms"    : "OAUTHBEARER",
+              "oauth_cb"           : oauth_cb,
+              "socket.timeout.ms"  : 15000,
+          })
+
+          md = admin.list_topics(timeout=15)
+          print(f"\n[kafka] ✅ Connected!")
+          print(f"[kafka] Brokers   : {len(md.brokers)}")
+          print(f"[kafka] Topics    : {len(md.topics)}")
+          for t in list(md.topics.keys())[:10]:
+              print(f"         - {t} ({len(md.topics[t].partitions)} partitions)")
+
+          PYEOF
+          echo "==> Done."
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "300m"
+          memory: "256Mi"

@@ -1,0 +1,139 @@
+# Minimal Python test pod for Google Managed Kafka (official quickstart style)
+#
+# Usage:
+#   kubectl apply -f k8s/kafka-python-test.yaml
+#   kubectl -n datadog logs -f pod/kafka-python-test
+#   kubectl -n datadog exec -it pod/kafka-python-test -- python producer.py -b <bootstrap> -t <topic>
+#
+# Cleanup:
+#   kubectl delete -f k8s/kafka-python-test.yaml
+---
+# apiVersion: v1
+# kind: ServiceAccount
+# metadata:
+#   name: datadog-agent-kafka
+#   annotations:
+#   iam.gke.io/gcp-service-account: kafka-sa@YOUR_PROJECT.iam.gserviceaccount.com
+#   labels:
+#     app: datadog-agent-kafka
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kafka-python-test
+spec:
+  serviceAccountName: kafka-sa
+  restartPolicy: Never
+  containers:
+    - name: python
+      image: python:3.11-slim
+      command: ["sleep", "3600"]
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "200m"
+          memory: "256Mi"
+      volumeMounts:
+        - name: code
+          mountPath: /app
+      workingDir: /app
+  volumes:
+    - name: code
+      configMap:
+        name: kafka-python-test-code
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-python-test-code
+
+data:
+  producer.py: |
+    import confluent_kafka
+    import argparse
+    from tokenprovider import TokenProvider
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-b', '--bootstrap-servers', dest='bootstrap', type=str, required=True)
+    parser.add_argument('-t', '--topic-name', dest='topic_name', type=str, default='example-topic', required=False)
+    parser.add_argument('-n', '--num_messages', dest='num_messages', type=int, default=1, required=False)
+    args = parser.parse_args()
+    
+    token_provider = TokenProvider()
+    
+    config = {
+        'bootstrap.servers': args.bootstrap,
+        'security.protocol': 'SASL_SSL',
+        'sasl.mechanisms': 'OAUTHBEARER',
+        'oauth_cb': token_provider.get_token,
+    }
+    
+    producer = confluent_kafka.Producer(config)
+    
+    def callback(error, message):
+        if error is not None:
+            print(error)
+            return
+        print("Delivered a message to {}[{}]".format(message.topic(), message.partition()))
+    
+    for i in range(args.num_messages):
+    
+      message = f"{i} hello world!".encode('utf-8')
+      producer.produce(args.topic_name, message, callback=callback)
+    
+    producer.flush()
+
+  tokenprovider.py: |
+    import base64
+    import datetime
+    import http.server
+    import json
+    import google.auth
+    from google.auth.transport.urllib3 import Request
+    import urllib3
+    import time
+    
+    def encode(source):
+      """Safe base64 encoding."""
+      return base64.urlsafe_b64encode(source.encode('utf-8')).decode('utf-8').rstrip('=')
+    
+    class TokenProvider(object):
+      """
+      Provides OAuth tokens from Google Cloud Application Default credentials.
+      """
+      HEADER = json.dumps({'typ':'JWT', 'alg':'GOOG_OAUTH2_TOKEN'})
+    
+      def __init__(self, **config):
+        self.credentials, _project = google.auth.default()
+        self.http_client = urllib3.PoolManager()
+    
+      def get_credentials(self):
+        if not self.credentials.valid:
+          self.credentials.refresh(Request(self.http_client))
+        return self.credentials
+    
+      def get_jwt(self, creds):
+        token_data = dict(
+          exp=creds.expiry.replace(tzinfo=datetime.timezone.utc).timestamp(),
+          iat=datetime.datetime.now(datetime.timezone.utc).timestamp(),
+          iss='Google',
+          sub=creds.service_account_email
+        )
+        return json.dumps(token_data)
+    
+      def get_token(self, args):
+        creds = self.get_credentials()
+        token = '.'.join([
+          encode(self.HEADER),
+          encode(self.get_jwt(creds)),
+          encode(creds.token)
+        ])
+    
+        # compute expiry time
+        expiry_utc = creds.expiry.replace(tzinfo=datetime.timezone.utc)
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        expiry_seconds = (expiry_utc - now_utc).total_seconds()
+    
+        return token, time.time() + expiry_seconds

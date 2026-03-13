@@ -1,0 +1,135 @@
+# ─────────────────────────────────────────────────────────────
+# values-kafka-oauth.yaml
+#
+# Standard Datadog Helm chart (datadog/datadog) values for a
+# SEPARATE release that runs only the kafka_consumer_gcp check.
+#
+# Your existing DaemonSet release is NOT affected.
+#
+#   helm install datadog-kafka-oauth datadog/datadog \
+#     -n datadog -f values-kafka-oauth.yaml
+#
+# Chart: https://github.com/DataDog/helm-charts/tree/main/charts/datadog
+# ─────────────────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════
+# 1. Datadog global settings
+# ═══════════════════════════════════════════════════════════════
+datadog:
+  # Re-use the API key secret from your existing DaemonSet release
+  apiKeyExistingSecret: "datadog-agent"
+  # apiKey: "<YOUR_DD_API_KEY>"           # alternative: inline key
+
+  clusterName: "YOUR_CLUSTER_NAME"
+
+  # ── Disable features not needed for this agent ─────────────
+  logs:
+    enabled: false
+  apm:
+    portEnabled: false
+  processAgent:
+    enabled: false
+  networkMonitoring:
+    enabled: false
+  serviceMonitoring:
+    enabled: false
+
+  # ── Cluster checks: lets the CLC Runner pick up checks ─────
+  clusterChecks:
+    enabled: true
+
+  # ── Inject the check CONFIG via the chart's native confd ───
+  #    This creates a ConfigMap and mounts it automatically at
+  #    /etc/datadog-agent/conf.d/kafka_consumer_gcp.d/conf.yaml
+  #
+  #    Config keys mirror the built-in kafka_consumer check:
+  #      https://docs.datadoghq.com/integrations/kafka/#configuration
+  #
+  #    The GCP OAuth (Python equivalent of GcpLoginCallbackHandler)
+  #    is injected automatically by the custom check code —
+  #    you just set security_protocol + sasl_mechanism here.
+  confd:
+    kafka_consumer_gcp.yaml: |-
+      init_config:
+
+      instances:
+        - ## Bootstrap servers — same format as built-in kafka_consumer
+          kafka_connect_str:
+            - "bootstrap.CLUSTER_ID.REGION.managedkafka.PROJECT_ID.cloud.goog:9092"
+
+          ## SASL/OAUTHBEARER via GCP (Python equivalent of GcpLoginCallbackHandler)
+          security_protocol: "SASL_SSL"
+          sasl_mechanism: "OAUTHBEARER"
+
+          ## Consumer groups — supports wildcards / glob patterns:
+          ##
+          ##   "*":                 # discover ALL consumer groups
+          ##     "*": []            # all topics, all partitions
+          ##
+          ##   "my-app-*":          # glob pattern on group names
+          ##     "orders-*": []     # glob on topic names
+          ##     "payments": [0,1]  # exact topic, specific partitions
+          ##
+          ##   "my-exact-group":    # exact group name
+          ##     "my-topic": []     # exact topic, all partitions
+          ##
+          consumer_groups:
+            "*":
+              "*": []
+
+          ## Collect broker/topic/partition counts
+          monitor_cluster_metrics: true
+
+          ## Custom tags on every metric
+          tags:
+            - env:YOUR_ENV
+            - kafka_cluster:YOUR_CLUSTER
+            - cloud:gcp
+
+          ## Check interval (seconds, default 15)
+          # min_collection_interval: 30
+
+# ═══════════════════════════════════════════════════════════════
+# 2. DaemonSet agents — DISABLED (your existing release has them)
+# ═══════════════════════════════════════════════════════════════
+agents:
+  enabled: false
+
+# ═══════════════════════════════════════════════════════════════
+# 3. Cluster Agent — DISABLED (your existing release has it)
+# ═══════════════════════════════════════════════════════════════
+clusterAgent:
+  enabled: false
+
+# ═══════════════════════════════════════════════════════════════
+# 4. Cluster Checks Runner — this is the one we deploy
+# ═══════════════════════════════════════════════════════════════
+clusterChecksRunner:
+  enabled: true
+  replicas: 1
+
+  # ── Custom image: stock agent + google-auth + confluent-kafka
+  image:
+    repository: "YOUR_REGISTRY/datadog-kafka-agent"
+    tag: "YOUR_TAG"
+    pullPolicy: Always
+
+  # ── K8s ServiceAccount with Workload Identity ──────────────
+  createServiceAccount: true
+  serviceAccount:
+    name: datadog-kafka-oauth-sa
+    annotations:
+      iam.gke.io/gcp-service-account: "KAFKA_SA@PROJECT_ID.iam.gserviceaccount.com"
+
+  # ── Resource limits ────────────────────────────────────────
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+  # ── Check code is baked into the custom Docker image ───────
+  #    (see Dockerfile: COPY checks.d/kafka_consumer_gcp.py)
+  #    Check CONFIG is handled by datadog.confd above.
