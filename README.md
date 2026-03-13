@@ -26,12 +26,16 @@ Runs as a **single-replica Deployment** (not a DaemonSet). No JMX. All metrics c
 ## Project structure
 
 ```
-datadog-kafka-agent/
-├── Dockerfile                          # FROM datadog/agent:7 + pip install + COPY check
+kafka-datadog-client-gcp/
+├── Dockerfile                              # FROM datadog/agent:7 + pip install + COPY check
 ├── checks.d/
-│   └── kafka_consumer_gcp.py           # Custom check (baked into image)
+│   └── kafka_consumer_gcp.py               # Custom check (baked into image)
+├── helm/
+│   └── values-kafka-oauth.yaml             # Helm chart values for Cluster Checks Runner
 ├── k8s/
-│   └── datadog-agent-kafka.yaml        # Deployment + ConfigMap (kubectl apply)
+│   ├── datadog-agent-kafka.yaml            # Deployment + ConfigMap (kubectl apply)
+│   ├── kafka-python-quickstart-test.yaml   # Quick OAuth + connectivity smoke test
+│   └── kafka-python-test.yaml             # Interactive producer test pod
 └── README.md
 ```
 
@@ -164,7 +168,147 @@ This creates in namespace `datadog`:
 
 ---
 
-## Step 4 — Verify
+## Step 4 — Test connectivity (optional)
+
+Before deploying the full Datadog agent you can validate that Workload Identity and the GCP OAuth token flow work correctly using two lightweight test pods. Both pods require no custom image — they use the stock `python:3.11-slim` image and authenticate via the KSA bound to your GCP Service Account.
+
+### `k8s/kafka-python-quickstart-test.yaml` — quick, self-contained smoke test
+
+This pod installs its own dependencies at startup, runs an inline Python script that obtains a `GOOG_OAUTH2_TOKEN` JWT, connects to Managed Kafka, lists brokers and topics, and then exits.
+
+**1. Set your bootstrap server**
+
+Edit the `BOOTSTRAP` env var in the file:
+
+```yaml
+env:
+  - name: BOOTSTRAP
+    value: "bootstrap.YOUR_CLUSTER.YOUR_REGION.managedkafka.YOUR_PROJECT.cloud.goog:9092"
+```
+
+**2. (Optional) Set namespace and ServiceAccount**
+
+If the pod should run in a specific namespace with a KSA that has Workload Identity configured, uncomment and fill in these lines:
+
+```yaml
+metadata:
+  namespace: YOUR_NAMESPACE   # uncomment the #namespace line
+
+spec:
+  serviceAccountName: kafka-sa   # uncomment the #serviceAccountName line
+```
+
+**3. Deploy, watch, and clean up**
+
+```bash
+kubectl apply -f k8s/kafka-python-quickstart-test.yaml
+
+# Stream logs — look for "[kafka] ✅ Connected!" and broker/topic counts
+kubectl logs -f pod/kafka-python-quickstart-test   # add -n YOUR_NAMESPACE if needed
+
+# Clean up after it exits
+kubectl delete -f k8s/kafka-python-quickstart-test.yaml
+```
+
+**Expected output:**
+
+```
+==> Installing dependencies...
+==> Running GCP Managed Kafka quickstart test...
+[auth] Credentials type : google.oauth2.service_account.Credentials
+[auth] Project           : your-gcp-project
+[auth] Token prefix      : ya29.c.b0...
+[auth] Valid             : True
+[oauth_cb] JWT length=612, expiry_in=3599s
+
+[kafka] Connecting to bootstrap.YOUR_CLUSTER... 
+[kafka] ✅ Connected!
+[kafka] Brokers   : 3
+[kafka] Topics    : 12
+         - my-topic (6 partitions)
+==> Done.
+```
+
+---
+
+### `k8s/kafka-python-test.yaml` — interactive producer pod
+
+This pod mounts `producer.py` and `tokenprovider.py` via a ConfigMap and stays alive for 1 hour (`sleep 3600`), letting you run producer tests interactively via `kubectl exec`.
+
+**Prerequisites**
+
+The pod uses `serviceAccountName: kafka-sa`. This KSA must already exist and must be annotated with your GCP Service Account for Workload Identity:
+
+```bash
+kubectl create serviceaccount kafka-sa -n <YOUR_NAMESPACE>
+
+kubectl annotate serviceaccount kafka-sa \
+  -n <YOUR_NAMESPACE> \
+  iam.gke.io/gcp-service-account=kafka-sa@YOUR_PROJECT.iam.gserviceaccount.com
+```
+
+Alternatively, uncomment and update the `ServiceAccount` block at the top of the file, then apply it together with the pod.
+
+**1. Deploy the pod**
+
+```bash
+kubectl apply -f k8s/kafka-python-test.yaml
+kubectl wait --for=condition=Ready pod/kafka-python-test --timeout=60s
+```
+
+**2. Install dependencies inside the pod**
+
+```bash
+kubectl exec -it pod/kafka-python-test -- \
+  pip install confluent-kafka google-auth urllib3 --quiet
+```
+
+**3. Produce test messages**
+
+```bash
+# Send 1 message (default)
+kubectl exec -it pod/kafka-python-test -- \
+  python producer.py \
+    -b bootstrap.YOUR_CLUSTER.YOUR_REGION.managedkafka.YOUR_PROJECT.cloud.goog:9092 \
+    -t YOUR_TOPIC
+
+# Send 10 messages
+kubectl exec -it pod/kafka-python-test -- \
+  python producer.py \
+    -b bootstrap.YOUR_CLUSTER.YOUR_REGION.managedkafka.YOUR_PROJECT.cloud.goog:9092 \
+    -t YOUR_TOPIC \
+    -n 10
+```
+
+**Expected output:**
+
+```
+Delivered a message to YOUR_TOPIC[0]
+Delivered a message to YOUR_TOPIC[2]
+...
+```
+
+**4. Clean up**
+
+```bash
+kubectl delete -f k8s/kafka-python-test.yaml
+```
+
+---
+
+### Choosing between the two
+
+| | `kafka-python-quickstart-test.yaml` | `kafka-python-test.yaml` |
+|---|---|---|
+| **Purpose** | Verify OAuth + connectivity in one shot | Interactive producer for ongoing testing |
+| **Lifetime** | Exits immediately after the test | Stays alive for 1 hour |
+| **Dependencies** | Self-installing at startup | Installed manually via `exec` |
+| **Output** | Broker + topic list | Per-message delivery confirmation |
+| **Use when** | First-time setup validation | Testing produce flow or topic behaviour |
+
+---
+
+## Step 5 — Verify
 
 ```bash
 # Pod running?
